@@ -1,84 +1,46 @@
 pragma solidity 0.8.24;
 
 import {IL1DAValidator, L1DAValidatorOutput} from "../../IL1DAValidator.sol";
-
-struct CelestiaZKStackInput {
-    AttestationProof attestationProof;
-    bytes equivalenceProof;
-    bytes publicValues;
-}
-
-struct DataRootTuple {
-    // Celestia block height the data root was included in.
-    // Genesis block is height = 0.
-    // First queryable block is height = 1.
-    uint256 height;
-    // Data root.
-    bytes32 dataRoot;
-}
-
-/// @notice Merkle Tree Proof structure.
-struct BinaryMerkleProof {
-    // List of side nodes to verify and calculate tree.
-    bytes32[] sideNodes;
-    // The key of the leaf to verify.
-    uint256 key;
-    // The number of leaves in the tree
-    uint256 numLeaves;
-}
-
-/// @notice Contains the necessary parameters needed to verify that a data root tuple
-/// was committed to, by the Blobstream smart contract, at some specif nonce.
-struct AttestationProof {
-    // the attestation nonce that commits to the data root tuple.
-    uint256 tupleRootNonce;
-    // the data root tuple that was committed to.
-    DataRootTuple tuple;
-    // the binary merkle proof of the tuple to the commitment.
-    BinaryMerkleProof proof;
-}
-
-interface IDAOracle {
-    /// @notice Verify a Data Availability attestation.
-    /// @param _tupleRootNonce Nonce of the tuple root to prove against.
-    /// @param _tuple Data root tuple to prove inclusion of.
-    /// @param _proof Binary Merkle tree proof that `tuple` is in the root at `_tupleRootNonce`.
-    /// @return `true` is proof is valid, `false` otherwise.
-    function verifyAttestation(
-        uint256 _tupleRootNonce,
-        DataRootTuple memory _tuple,
-        BinaryMerkleProof memory _proof
-    ) external view returns (bool);
-}
-
-interface ISP1Verifier {
-    /// @notice Verifies a proof with given public values and vkey.
-    /// @dev It is expected that the first 4 bytes of proofBytes must match the first 4 bytes of
-    /// target verifier's VERIFIER_HASH.
-    /// @param programVKey The verification key for the RISC-V program.
-    /// @param publicValues The public values encoded as bytes.
-    /// @param proofBytes The proof of the program execution the SP1 zkVM encoded as bytes.
-    function verifyProof(bytes32 programVKey, bytes calldata publicValues, bytes calldata proofBytes) external view;
-}
+import {IDAOracle} from "./IDAOracle.sol";
+import {ISP1Verifier} from "./ISP1Verifier.sol";
+import {CelestiaZKStackInput} from "./types.sol";
 
 contract CelestiaL1DAValidator is IL1DAValidator {
-    address public constant SP1_GROTH_16_VERIFIER = 0x397A5f7f3dBd538f23DE225B51f532c34448dA9B;
+    error InvalidProof();
+    error OperatorDAHashMismatch(bytes32 expected, bytes32 actual);
+    error DataRootMismatch(bytes32 expected, bytes32 actual);
 
-    // THIS is the SEPOLIA address, make sure each deployment has the right address!
-    address public constant BLOBSTREAM = 0x7Cf3876F681Dbb6EdA8f6FfC45D66B996Df08fAe;
+    address public immutable SP1_GROTH_16_VERIFIER;
+    address public immutable BLOBSTREAM;
+    bytes32 public immutable eqsVkey;
 
-    bytes32 eqsVkey = 0x005a902e725cde951470b808cc74ba08d2470219e281b82aec0a1c239da7db7e;
+    constructor(
+        address _sp1Groth16Verifier,
+        address _blobstream,
+        bytes32 _eqsVkey
+    ) {
+        SP1_GROTH_16_VERIFIER = _sp1Groth16Verifier;
+        BLOBSTREAM = _blobstream;
+        eqsVkey = _eqsVkey;
+    }
 
     function checkDA(
         uint256 chainId,
         uint256 batchNumber,
         bytes32 l2DAValidatorOutputHash,
-        bytes calldata _operatorDAInput,
+        bytes calldata operatorDAInput,
         uint256 _maxBlobsSupported
     ) external returns (L1DAValidatorOutput memory output) {
-        CelestiaZKStackInput memory input = abi.decode(_operatorDAInput, (CelestiaZKStackInput));
+        CelestiaZKStackInput memory input = abi.decode(operatorDAInput[32:], (CelestiaZKStackInput));
 
-        (bytes32 eqKeccakHash, bytes32 eqDataRoot) = abi.decode(input.publicValues, (bytes32, bytes32));
+        bytes memory publicValues = input.publicValues;  // get reference to bytes
+        bytes32 eqKeccakHash;
+        bytes32 eqDataRoot;
+        assembly {
+            let ptr := add(publicValues, 32)  // skip length prefix
+            eqKeccakHash := mload(ptr)        // first bytes32
+            eqDataRoot := mload(add(ptr, 32)) // second bytes32
+        }
 
         // First verify the equivalency proof (im assuming this call reverts if the proof ins invalid, so we move onward from here)
         ISP1Verifier(SP1_GROTH_16_VERIFIER).verifyProof(eqsVkey, input.publicValues, input.equivalenceProof);
@@ -91,14 +53,14 @@ contract CelestiaL1DAValidator is IL1DAValidator {
         );
 
         // can use custom error or whatever matter labs likes the most
-        if (!valid) revert("INVALID_PROOF");
+        if (!valid) revert InvalidProof();
 
-        output.stateDiffHash = l2DAValidatorOutputHash;
+        output.stateDiffHash = bytes32(operatorDAInput[:32]);
 
-        if (output.stateDiffHash != eqKeccakHash)
-            revert("operator DA hash does not match value from equivalence proof");
+        if (l2DAValidatorOutputHash != keccak256(abi.encodePacked(output.stateDiffHash, eqKeccakHash)))
+            revert OperatorDAHashMismatch(eqKeccakHash, output.stateDiffHash);
         if (input.attestationProof.tuple.dataRoot != eqDataRoot)
-            revert("data root does not match value from equivalence proof");
+            revert DataRootMismatch(eqDataRoot, input.attestationProof.tuple.dataRoot);
 
         output.blobsLinearHashes = new bytes32[](_maxBlobsSupported);
         output.blobsOpeningCommitments = new bytes32[](_maxBlobsSupported);
